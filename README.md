@@ -1,10 +1,24 @@
 # Patient Event Ingest Service
 
-This NestJS service is the HTTP entry point for patient events sent by third
-parties. It validates and durably records each accepted event in MongoDB, then an
-in-process worker handles it asynchronously. The API returns HTTP 202 before the
-five-second simulated processing finishes so request latency is limited to
-validation and the acknowledged database write, rather than downstream work.
+This NestJS service accepts patient events from third parties, persists them in
+MongoDB, and processes them asynchronously. HTTP 202 is returned after the
+database acknowledges the write, without waiting for the five-second simulated
+processing step.
+
+## Quick start
+
+With Node.js 24 LTS, npm, and Docker Compose installed:
+
+```bash
+docker compose up --build -d --wait
+
+curl --request POST http://localhost:3000/events \
+  --header 'Content-Type: application/json' \
+  --header 'Idempotency-Key: example-event-1' \
+  --data '{"patientId":"patient-123","type":"observation.created","data":{"value":72},"ts":"2026-09-03T12:00:00Z"}'
+```
+
+Stop the stack with `docker compose down`; the named MongoDB volume is retained.
 
 ## API
 
@@ -19,85 +33,61 @@ validation and the acknowledged database write, rather than downstream work.
 }
 ```
 
-```bash
-curl --request POST http://localhost:3000/events \
-  --header 'Content-Type: application/json' \
-  --header 'Idempotency-Key: example-event-1' \
-  --data '{"patientId":"patient-123","type":"observation.created","data":{"value":72},"ts":"2026-09-03T12:00:00Z"}'
-```
+| Response | Meaning |
+| --- | --- |
+| `202 Accepted` | MongoDB acknowledged the event; returns `{"eventId":"<id>","status":"accepted"}`. |
+| `400 Bad Request` | The header or strict payload validation failed. |
+| `409 Conflict` | The key already identifies a different normalized payload. |
 
-- `202 Accepted`: MongoDB acknowledged the event. The response is
-  `{"eventId":"<id>","status":"accepted"}`.
-- `400 Bad Request`: the header is missing or invalid, or the strict payload
-  validation fails.
-- `409 Conflict`: the idempotency key already belongs to a different normalized
-  payload.
+The same key and normalized payload returns the original event ID without another
+insert. Nested object keys are canonicalized before hashing, so property order is
+irrelevant. The health check is `GET /health`.
 
-Repeating the same key and normalized payload returns HTTP 202 with the original
-event ID and does not create another document. Payload hashes canonicalize nested
-object keys, so JSON property order does not affect duplicate detection. The
-health check is available at `GET /health`.
+## Architecture and trade-offs
 
-## Architecture and lifecycle
+1. Zod validates the HTTP header and payload.
+2. MongoDB records a `pending` event using majority and journal acknowledgement
+   with a five-second write-concern timeout; only then can the API return 202.
+3. The worker atomically claims work, changes it to `processing`, and maintains a
+   renewable lease with an owner and claim token.
+4. Success records `processedAt` and `{"outcome":"processed"}`. Failure returns
+   to `pending` with capped exponential backoff and its last error; expired leases
+   are reclaimable.
 
-1. The controller validates the header and body with Zod.
-2. The API inserts an event with `pending` status and waits for MongoDB to
-   acknowledge it before returning 202.
-3. A worker atomically claims eligible work in MongoDB, changes it to
-   `processing`, and records a renewable lease owner and claim token.
-4. Successful processing records `processedAt`, the result
-   `{"outcome":"processed"}`, and `processed` status.
-5. Failures return to `pending` with capped exponential backoff and the last
-   error. An expired lease can be reclaimed after a process crash.
+Attempts, leases, errors, queue state, and outcomes remain in the single `events`
+collection. MongoDB therefore satisfies the assignment's durable single-collection
+queue constraint without adding Redis or Kafka.
 
-Queue state, attempts, leases, errors, and outcomes all remain in the single
-`events` collection. MongoDB is also the durable queue because that satisfies the
-assignment's single-collection constraint and avoids adding Redis or Kafka and
-their operational overhead.
+| Assignment condition | Implementation |
+| --- | --- |
+| Traffic with five-second work | Bounded concurrency: `100 × 60 / 5 ≈ 1,200` theoretical slots/minute. |
+| Sender retries | Global idempotency key, normalized payload hash, and unique index. |
+| Immediate response | Persist and receive acknowledgement, then return HTTP 202. |
+| Per-patient state | MongoDB-enforced serialization; different patients run concurrently. |
+| Crashes and restarts | Renewable leases, retries, expired-lease recovery, and claim-token fencing. |
+| Out-of-order delivery | `ts` ordering with `_id` tie-breaker and the late-arrival limitation below. |
 
-## Design reasoning
+Concurrency defaults to 100 and is bounded rather than creating unlimited
+promises. A unique partial index permits one lock-holding event per patient across
+instances. Retrying events retain that lock, so later queued events cannot
+overtake them.
 
-Processing concurrency is bounded and configurable, rather than creating an
-unbounded number of promises. Its default is 100: `100 × 60 / 5 ≈ 1,200`
-theoretical processing slots per minute, slightly above the expected 1,000 events
-per minute.
+### Guarantees and limitations
 
-Different patients can use those slots concurrently. For one patient, a unique
-partial index permits only one lock-holding event, including across service
-instances. Queued events are selected by event timestamp and MongoDB `_id` as a
-deterministic tie-breaker. A retry retains the patient's database lock, preventing
-a later event from overtaking it. The idempotency-key unique index likewise makes
-concurrent event acceptance race-safe. Renewable MongoDB leases allow another
-process to recover abandoned work after a restart.
-
-## Guarantees and limitations
-
-- HTTP 202 means MongoDB acknowledged persistence; it does not mean processing
-  has finished.
-- A global idempotency key identifies one MongoDB event and recorded outcome.
-  Keys are global because sender identity is outside this assignment's contract.
-- Processing is retryable and at-least-once. Lease ownership and claim tokens
-  prevent a stale worker from recording completion after another claim takes over.
-- A real external system must also accept the idempotency key. A worker can crash
-  after an external call succeeds but before completion is stored in MongoDB, so
-  the service does not claim exactly-once external side effects.
-- Events already queued for a patient are ordered by `ts` and `_id`, but
-  arbitrarily late arrival cannot be ordered perfectly from `ts` alone. A
-  production contract needs a source sequence or watermark, or a replay strategy.
+- Processing is retryable and at-least-once. Claim-token checks prevent a stale
+  worker from recording completion after reclamation.
+- A real downstream system must also accept the idempotency key: a crash can occur
+  after its call succeeds but before MongoDB records completion. Exactly-once
+  external effects are not claimed.
+- Arbitrary late arrivals cannot be perfectly ordered using only `ts`; production
+  needs a source sequence or watermark, or a replay strategy.
+- Idempotency keys are global because sender identity is outside this assignment.
+- Local Docker Compose uses standalone MongoDB. For it, `w: "majority"` still
+  represents one node; production redundancy requires a replica set.
 
 ## Local development
 
-Prerequisites are Node.js 24 LTS, npm, and Docker with Docker Compose. Use
-`nvm use` with the included `.nvmrc` if desired.
-
-Start the complete stack:
-
-```bash
-docker compose up --build -d
-docker compose logs -f app
-```
-
-For direct npm development with only MongoDB in Docker:
+For direct npm development with MongoDB in Docker:
 
 ```bash
 npm install
@@ -106,14 +96,12 @@ docker compose up -d mongo
 npm run start:dev
 ```
 
-Environment variables:
-
-- `NODE_ENV`: `development`, `test`, or `production`; defaults to `development`.
-- `PORT`: HTTP port; defaults to `3000`.
-- `MONGO_URI`: required MongoDB connection URI.
-- `WORKER_CONCURRENCY`: positive worker limit; defaults to `100`.
-
-Checks and tests:
+| Variable | Purpose and default |
+| --- | --- |
+| `NODE_ENV` | `development`, `test`, or `production`; default `development`. |
+| `PORT` | HTTP port; default `3000`. |
+| `MONGO_URI` | Required MongoDB connection URI. |
+| `WORKER_CONCURRENCY` | Positive bounded worker limit; default `100`. |
 
 ```bash
 npm run lint
@@ -123,23 +111,20 @@ npm test
 npm run test:e2e
 ```
 
-The e2e suite requires Docker. Stop services with `docker compose down`, which
-preserves the named MongoDB volume. Use `docker compose down --volumes` when the
+The e2e suite requires Docker. Use `docker compose down --volumes` only when the
 local database should also be deleted.
 
 ## Testing strategy
 
-Vitest unit tests cover pure validation, health, and canonical payload hashing.
-The e2e suites use Testcontainers with real MongoDB and cover validation and
-idempotency races, acknowledged persistence, asynchronous completion,
-cross-patient concurrency, per-patient ordering, retries, and expired-lease
-recovery. Worker tests inject controllable processing and timing so they do not
-wait for the production five-second delay.
+Fast Vitest tests cover validation, health, and canonical hashing. Testcontainers
+tests use real MongoDB for persistence and idempotency races, asynchronous
+completion, bounded coordination, per-patient ordering, retries, and lease
+recovery. Injected processors and timing keep worker tests fast.
 
 ## Production follow-ups
 
-- Run MongoDB as a replica set and choose explicit production durability settings.
+- Deploy a multi-node MongoDB replica set and verify durability settings.
 - Add sender-scoped identity and source sequence numbers or watermarks.
-- Require downstream systems to honor the event idempotency key.
-- Add metrics, alerting, and backlog/lease monitoring.
-- Consider separate API and worker deployments as traffic and scaling needs grow.
+- Require downstream idempotency.
+- Add metrics, alerting, and backlog monitoring.
+- Separate API and worker deployments if traffic growth warrants it.
