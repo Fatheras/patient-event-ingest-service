@@ -1,30 +1,65 @@
 import type { INestApplication } from '@nestjs/common';
+import { getConnectionToken } from '@nestjs/mongoose';
 import { Test, type TestingModule } from '@nestjs/testing';
+import type { Connection } from 'mongoose';
 import request from 'supertest';
 import type { App } from 'supertest/types.js';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { AppModule } from '../src/app.module.js';
+import {
+  GenericContainer,
+  type StartedTestContainer,
+  Wait,
+} from 'testcontainers';
+import { describe, expect, it, vi } from 'vitest';
 
-describe('Health endpoint (e2e)', () => {
-  let app: INestApplication<App>;
+const MONGODB_PORT = 27_017;
 
-  beforeEach(async () => {
-    const testingModule: TestingModule = await Test.createTestingModule({
-      imports: [AppModule],
-    }).compile();
+describe('MongoDB connectivity (e2e)', () => {
+  it('starts the application with MongoDB and serves its health endpoint', async () => {
+    let app: INestApplication<App> | undefined;
+    let mongoContainer: StartedTestContainer | undefined;
 
-    app = testingModule.createNestApplication();
-    await app.init();
-  });
+    try {
+      mongoContainer = await new GenericContainer('mongo:8.0')
+        .withExposedPorts(MONGODB_PORT)
+        .withWaitStrategy(Wait.forLogMessage(/Waiting for connections/))
+        .start();
+      vi.stubEnv('NODE_ENV', 'test');
+      vi.stubEnv('PORT', '3000');
+      vi.stubEnv(
+        'MONGO_URI',
+        `mongodb://${mongoContainer.getHost()}:${mongoContainer.getMappedPort(MONGODB_PORT)}/patient_events`,
+      );
 
-  afterEach(async () => {
-    await app.close();
-  });
+      const { AppModule } = await import('../src/app.module.js');
+      const testingModule: TestingModule = await Test.createTestingModule({
+        imports: [AppModule],
+      }).compile();
 
-  it('GET /health returns HTTP 200 with an ok status', async () => {
-    const response = await request(app.getHttpServer()).get('/health');
+      app = testingModule.createNestApplication();
+      await app.init();
 
-    expect(response.status).toBe(200);
-    expect(response.body).toEqual({ status: 'ok' });
-  });
+      const response = await request(app.getHttpServer()).get('/health');
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ status: 'ok' });
+
+      const connection = app.get<Connection>(getConnectionToken());
+      if (!connection.db) {
+        throw new Error('Mongoose did not establish a database connection');
+      }
+
+      await expect(connection.db.admin().ping()).resolves.toMatchObject({
+        ok: 1,
+      });
+    } finally {
+      try {
+        await app?.close();
+      } finally {
+        try {
+          await mongoContainer?.stop();
+        } finally {
+          vi.unstubAllEnvs();
+        }
+      }
+    }
+  }, 120_000);
 });

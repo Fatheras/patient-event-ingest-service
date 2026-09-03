@@ -3,6 +3,7 @@ dist/
 coverage/
 .env
 .env.*
+!.env.example
 .idea/
 .vscode/
 *.swp
