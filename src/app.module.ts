@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { MongooseModule } from '@nestjs/mongoose';
 import { environmentValidationSchema } from './config/environment.validation.js';
+import { EventsModule } from './events/events.module.js';
 import { HealthController } from './health.controller.js';
 
 @Module({
@@ -19,6 +20,7 @@ import { HealthController } from './health.controller.js';
         retryAttempts: 0,
       }),
     }),
+    EventsModule,
   ],
   controllers: [HealthController],
 })
