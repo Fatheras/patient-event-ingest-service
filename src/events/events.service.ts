@@ -40,6 +40,8 @@ export class EventsService implements OnModuleInit {
         data: payload.data,
         ts: new Date(payload.ts),
         status: 'pending',
+        attemptCount: 0,
+        nextAttemptAt: new Date(),
       });
 
       return { eventId: event.id as string, status: 'accepted' };

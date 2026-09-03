@@ -1,8 +1,6 @@
 import { Prop, Schema, SchemaFactory } from '@nestjs/mongoose';
-import { SchemaTypes, type HydratedDocument } from 'mongoose';
+import { SchemaTypes, type Schema as MongooseSchema } from 'mongoose';
 import type { JsonObject } from './event.validation.js';
-
-export type EventDocument = HydratedDocument<EventRecord>;
 
 @Schema({ collection: 'events', timestamps: true, versionKey: false })
 export class EventRecord {
@@ -24,13 +22,49 @@ export class EventRecord {
   @Prop({ required: true })
   ts!: Date;
 
-  @Prop({ enum: ['pending'], required: true })
-  status!: 'pending';
+  @Prop({ enum: ['pending', 'processing', 'processed'], required: true })
+  status!: 'pending' | 'processing' | 'processed';
+
+  @Prop({ default: 0, required: true })
+  attemptCount!: number;
+
+  @Prop({ default: Date.now, required: true })
+  nextAttemptAt!: Date;
+
+  @Prop()
+  patientLeaseKey?: string;
+
+  @Prop()
+  leaseOwner?: string;
+
+  @Prop()
+  claimToken?: string;
+
+  @Prop()
+  leaseExpiresAt?: Date;
+
+  @Prop()
+  lastError?: string;
+
+  @Prop()
+  processedAt?: Date;
+
+  @Prop({ type: SchemaTypes.Mixed })
+  result?: JsonObject;
 
   createdAt!: Date;
   updatedAt!: Date;
 }
 
-export const EventSchema = SchemaFactory.createForClass(EventRecord);
+export const EventSchema: MongooseSchema<EventRecord> =
+  SchemaFactory.createForClass<object>(EventRecord) as MongooseSchema<EventRecord>;
 
 EventSchema.index({ idempotencyKey: 1 }, { unique: true });
+EventSchema.index(
+  { patientLeaseKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { patientLeaseKey: { $type: 'string' } },
+  },
+);
+EventSchema.index({ status: 1, nextAttemptAt: 1, leaseExpiresAt: 1, ts: 1 });

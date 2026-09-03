@@ -41,6 +41,23 @@ clients can safely retry: the same key and normalized payload return the origina
 event, while using the key for a different payload returns HTTP 409. Keys are
 currently global across all patients and event types.
 
+## Background processing
+
+An in-process worker claims events atomically in MongoDB and processes them with
+bounded concurrency. The default of 100 workers provides about 1,200 five-second
+processing slots per minute, slightly above the expected 1,000 events per minute;
+set `WORKER_CONCURRENCY` to tune it. Claims use renewable leases, so another
+instance can recover work after a crashed worker's lease expires. A unique partial
+index serializes processing per patient, and retries retain that patient's lock so
+later events cannot overtake a failed event.
+
+Within the currently queued set, patient events are selected by timestamp and a
+deterministic ID tie-breaker. Arbitrarily late arrival cannot be perfectly ordered
+from `ts` alone; a production contract would need a source sequence or watermark,
+or an explicit replay strategy. MongoDB records one processing outcome, but a real
+external side effect must also accept the idempotency key: a process can crash
+after the external call and before recording completion in MongoDB.
+
 ## Checks and tests
 
 ```bash

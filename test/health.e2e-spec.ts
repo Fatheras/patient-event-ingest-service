@@ -10,8 +10,20 @@ import {
   Wait,
 } from 'testcontainers';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  EVENT_WORKER_OPTIONS,
+  type EventWorkerOptions,
+} from '../src/events/events-worker.options.js';
 
 const MONGODB_PORT = 27_017;
+const disabledWorkerOptions: EventWorkerOptions = {
+  autoStart: false,
+  concurrency: 100,
+  leaseDurationMs: 30_000,
+  pollIntervalMs: 100,
+  retryBaseDelayMs: 1_000,
+  retryMaxDelayMs: 60_000,
+};
 const validPayload = {
   patientId: 'patient-123',
   type: 'observation.created',
@@ -39,7 +51,10 @@ describe('Application (e2e)', () => {
     const { AppModule } = await import('../src/app.module.js');
     const testingModule: TestingModule = await Test.createTestingModule({
       imports: [AppModule],
-    }).compile();
+    })
+      .overrideProvider(EVENT_WORKER_OPTIONS)
+      .useValue(disabledWorkerOptions)
+      .compile();
 
     app = testingModule.createNestApplication();
     await app.listen(0);
