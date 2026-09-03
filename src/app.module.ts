@@ -17,6 +17,7 @@ import { HealthController } from './health.controller.js';
       useFactory: (configService: ConfigService) => ({
         uri: configService.getOrThrow<string>('MONGO_URI'),
         serverSelectionTimeoutMS: 5_000,
+        writeConcern: { w: 'majority', journal: true, wtimeoutMS: 5_000 },
         retryAttempts: 0,
       }),
     }),
